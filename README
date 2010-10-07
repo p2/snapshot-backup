@@ -1,0 +1,116 @@
+-----------------------------------------------------------
+Automated snapshot backups using rsync and launchd over ssh
+-----------------------------------------------------------
+Monday, October 5th 2009
+
+I needed to backup the contents of a file sharing directory of a server in our LAN to the shiny new mirrored 1 TB RAID inside my Mac Pro. Having a simple backup is nice, but it's even better to have snapshots, with the possibility to jump back to any date and have the exact representation of the disk as it was back then (TimeMachine also does this pretty well for Macs). 
+
+Always creating a complete backup would be a waste of disk space par excellence and in my case - backup via LAN - also pretty hard on the network. Fortunately there is rsync, and there's our friends ssh and launchd. rsync takes advantage of *NIX file system hardlinks and when called with the right arguments only backs up new files since the last backup, pointing to the older copy of a file if the file has not changed in the meantime. Mike Rubel has written up a nice article covering these aspects of rsync, check it out: http://www.mikerubel.org/computers/rsync_snapshots/
+
+Thanks to rsync, backing up remote content to a local disk (or vice versa) is pretty easy, but there are some things to consider when automating the whole process. I've written a script that currently runs successfully on my Mac; it's called once daily at night (maybe I should say "every 24 hours") by launchd and uses SSH's shared keys feature to authenticate the machine. 
+
+
+= Breakdown =
+
+Here's a little breakdown of the process. Since we use launchd on this one, the script is run as the root user, keep that in mind! 
+
+The script takes two arguments, first argument is the SOURCE directory and the second argument the TARGET directory. The script then creates a folder with the current date inside the TARGET directory and performs a backup of SOURCE into this directory using rsync. 
+
+At the top of the script you can set some options, then follows a check whether you really provided the two arguments, the TARGET directory is created if it does not yet exist, and the name for the new snapshot is created using the date function. This code is all pretty straightforward, no need to show it here. 
+
+Since we want to use incremental backups, we're going to tell rsync in which directory it can find the latest backup, so that rsync only needs to transfer the new files. I use ls -U to get the latest directory first - what puzzles me here is that the list I get is reversed, means that the newest directory appears at the bottom. According to the man page it should be the other way round, now I don't know whether I didn't understand the man page or whether this is a Bug in Snow Leopard. If you're going to use this script verify this behavior and use head -n1 instead of tail -n1!
+ 
+	REFERENCE=$(ls -U "$TARGET" | tail -n1)		# why the hell does this sort the oldest files first??
+	if [ ! -d "$TARGET/$REFERENCE" ]; then
+		REFERENCE=''
+	fi
+
+
+= SSH Authentification =
+
+Then comes the tricky part with SSH. In order to not have to type the SSH password each time the backup runs, we use SSH public key authentification, which is always a good idea anyway. (If you don't know what this is, you might want to read a little). 
+But since we want to use this script from launchd, and the environment of launchd is not aware of ssh-agent, ssh won't know our SSH key and will ask for the password, nevertheless. So we need to ssh-add our key to the ssh-agent every time launchd performs our script. This works - as long as you have no passphrase for your ssh key set (which you should have!). 
+If you have a passphrase, we take advantage of SSH_ASKPASS: If there is no display where the script could ask for a password, it launches the program given as SSH_ASKPASS - this program should return the pass - typically this is a password input window. But we don't want a window, so we provide a program that simply returns our passkey. I have a script that simply echo-es my password, named 'catp', in root's home directory, chmodded to 0700. THIS IS A SECURITY RISK, however small, but I've found no other solution to this so far. 
+
+So we check whether SSH is needed (we assume this when an @ is present in either directory path), set DISPLAY to none and give our password returning script to SSH_ASKPASS, then setup ssh-agent and ssh-add our key:
+
+	if [ 'xx'"$SOURCE" = 'xx'$(echo "$SOURCE" | grep @) ] || [ 'xx'"$TARGET" = 'xx'$(echo "$TARGET" | grep @) ]; then
+		export DISPLAY=none:0.0
+		export SSH_ASKPASS='/var/root/catp'
+		eval $(/usr/bin/ssh-agent -s) >/dev/null
+		/usr/bin/ssh-add >/dev/null
+	fi
+
+
+= Calling rsync =
+
+Finally we can call rsync. We first check whether there actually is an older backup, if not we just create a new one. If there already is a backup, we tell rsync to first look in the directory --link-dest for the files before transferring them again. 
+
+Assume a file has not changed and is already present on the backup. rsync now sees this file, sees that it's still the same, and instead of copying it again creates a file system hardlink to this file. You now have two filenames (one in the new and one in the older directory), that point to the same file, and you can still "delete" the old file - as long as another name points to the file, the file is not deleted. And as you now see, this way you can delete any backup, the other existing backups will always be unaffected, as if the file had been copied for every backup. Really nice! 
+
+Note I use --numeric-ids since I backup to another machine than where the data is stored.
+
+	# no reference, so most likely first backup!
+	if [ 'xx' = $REFERENCE'xx' ]; then
+		echo $(date "$LOGDATEFORMAT")" -->  Going to create first backup in $SNAP_NAME"
+		rsync --numeric-ids -a "$SOURCE/" "$TARGET/$SNAP_NAME/"
+	
+	
+	# we have a reference, create a new snapshot
+	else
+		echo $(date "$LOGDATEFORMAT")" -->  Going to create snapshot in $SNAP_NAME, hardlinking to $REFERENCE"
+		rsync -a --numeric-ids --delete --link-dest="$TARGET/$REFERENCE" "$SOURCE/" "$TARGET/$SNAP_NAME/"
+	fi
+
+
+= Deleting old backups =
+
+This part is actually pretty basic, one could certainly expand this code. You can set a max lifetime of the backups, which I set to 180 days. Snapshots older than 180 days will be deleted by the following code. 
+Note I got some errors using find ... -exec rm -r {} \;, so I used a simple for loop. :)
+
+	if [[ $PURGE_IF_OLDER > 0 ]]; then
+		for oldsnapshot in $(find "$TARGET" -ctime +"$PURGE_IF_OLDER"d -depth 1); do		# got errors using -exec rm -r {} \;
+			rm -r "$oldsnapshot"
+		done
+	fi
+
+
+= Automating with launchd =
+
+Now it's time to tell launchd to start this backup regularly. It's easiest to use Lingon to do this. Lingon is no longer being developed, but still works for me. 
+Create a new Users Daemons entry, give it a name under (1) and provide what it has to do under (2). For me this is:
+
+	/etc/snapshot_backup.sh serveruser@fileserver.domain.ch:/volumes/save_me /Volumes/MyRaid/Backups/save_me
+
+Then under (3) you can set to have it run whenever you like. I run it every night at 23:45 - it would probably be even better to let it run at around 3:00 in the night, but then the date of the backup folders would always be one day off. Minor issue, though. 
+
+Here is the complete XML, to be placed inside /Library/LaunchDaemons. If you do this manually, don't forget to sudo launchctl load -w /Library/LaunchDaemons/ch.my_new_backup_deamon.plist.
+ 
+	<?xml version="1.0" encoding="UTF-8"?>
+	<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+	<plist version="1.0">
+	<dict>
+		<key>Label</key>
+		<string>ch.my_new_backup_deamon</string>
+		<key>ProgramArguments</key>
+		<array>
+			<string>/etc/snapshot_backup.sh</string>
+			<string>serveruser@fileserver.domain.ch:/volumes/save_me</string>
+			<string>/Volumes/MyRaid/Backups/save_me</string>
+		</array>
+		<key>StandardErrorPath</key>
+		<string>/var/log/backup_error.log</string>
+		<key>StandardOutPath</key>
+		<string>/var/log/backup.log</string>
+		<key>StartCalendarInterval</key>
+		<dict>
+			<key>Hour</key>
+			<integer>23</integer>
+			<key>Minute</key>
+			<integer>45</integer>
+		</dict>
+	</dict>
+	</plist>
+
+
+Have fun!
